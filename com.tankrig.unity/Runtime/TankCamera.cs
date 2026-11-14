@@ -54,6 +54,13 @@ namespace TankRig
             Cursor.visible = true;
         }
 
+        static string BeltText(GunFeed feed, MachineGunSpec spec)
+        {
+            if (spec == null || spec.beltSize <= 0) return "射撃可";
+            if (feed.Reloading) return $"ベルト交換中 {feed.ReloadLeft:0.0} 秒";
+            return $"残り {(feed.Left < 0 ? spec.beltSize : feed.Left)} / {spec.beltSize} 発";
+        }
+
         public void Shake(float amount) => shake = Mathf.Max(shake, amount);
 
         void LateUpdate()
@@ -124,10 +131,43 @@ namespace TankRig
                 }
             }
 
+            // where each secondary turret points (smaller marker)
+            if (target.secondaryTurrets != null)
+                foreach (var st in target.secondaryTurrets)
+                {
+                    if (st == null || !st.muzzle) continue;
+                    float dist = Vector3.Distance(st.muzzle.position, AimPoint);
+                    Vector3 sp = cam.WorldToScreenPoint(st.muzzle.position + st.muzzle.forward * dist);
+                    if (sp.z <= 0f) continue;
+                    float x = sp.x, y = Screen.height - sp.y;
+                    bool ready = st.weapon == SecondaryWeapon.MachineGun ? !st.Feed.Reloading : st.Ready;
+                    GUI.color = ready ? new Color(0.5f, 0.9f, 1f, 0.85f) : new Color(1f, 0.6f, 0.2f, 0.85f);
+                    GUI.DrawTexture(new Rect(x - 5, y - 1, 10, 2), white);
+                    GUI.DrawTexture(new Rect(x - 1, y - 5, 2, 10), white);
+                }
+
             GUI.color = Color.white;
-            GUI.Label(new Rect(16, Screen.height - 54, 400, 22), $"速度 {target.Speed * 3.6f:0} km/h");
-            GUI.Label(new Rect(16, Screen.height - 32, 400, 22), target.Reload01 >= 1f ? "主砲: 装填完了" : $"主砲: 装填中 {target.Reload01 * 100f:0}%");
-            GUI.Label(new Rect(16, 12, 900, 22), "W/S: 前進・後退   A/D: 旋回   マウス: 照準   左クリック: 主砲   Space: 機銃   右クリック: ズーム   ホイール: 距離   L: ライト   Esc: カーソル解放");
+            float line = Screen.height - 32;
+            GUI.Label(new Rect(16, line, 400, 22), target.Reload01 >= 1f ? "主砲: 装填完了" : $"主砲: 装填中 {target.Reload01 * 100f:0}%");
+            if (target.secondaryTurrets != null)
+                foreach (var st in target.secondaryTurrets)
+                {
+                    if (st == null) continue;
+                    line -= 22;
+                    string state = st.weapon == SecondaryWeapon.MachineGun
+                        ? BeltText(st.Feed, st.machineGun)
+                        : st.Ready ? "装填完了" : $"装填中 {st.Reload01 * 100f:0}%";
+                    GUI.Label(new Rect(16, line, 400, 22), $"{st.name}: {state}");
+                }
+            if (target.machineGuns != null)
+                foreach (var mg in target.machineGuns)
+                {
+                    if (mg == null || mg.spec == null || mg.spec.beltSize <= 0) continue;
+                    line -= 22;
+                    GUI.Label(new Rect(16, line, 400, 22), $"{mg.name}: {BeltText(mg.Feed, mg.spec)}");
+                }
+            GUI.Label(new Rect(16, line - 22, 400, 22), $"速度 {target.Speed * 3.6f:0} km/h");
+            GUI.Label(new Rect(16, 12, 1100, 22), "W/S: 前進・後退   A/D: 旋回   マウス: 照準   左クリック: 主砲   Space: 機銃   中クリック/F: 副武装   右クリック: ズーム   ホイール: 距離   L: ライト   Esc: カーソル解放");
         }
     }
 }

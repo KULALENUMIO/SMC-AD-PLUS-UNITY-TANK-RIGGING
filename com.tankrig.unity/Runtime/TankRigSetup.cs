@@ -1,3 +1,4 @@
+using System.Collections.Generic;
 using UnityEngine;
 
 namespace TankRig
@@ -37,7 +38,7 @@ namespace TankRig
 
         [Header("ポイント")]
         public Transform muzzle;
-        public Transform machineGun;
+        [Tooltip("旧形式（v0.6 まで）の機銃。組み立てウィンドウで開くと「機銃」の一覧に移ります")] [HideInInspector] public Transform machineGun;
         public Transform exhaust;
         public Transform headlight;
         public Transform rearLight;
@@ -47,7 +48,14 @@ namespace TankRig
         public bool mirrorExhaust = true;
         public bool mirrorHeadlight = true;
         public bool mirrorRearLight = true;
-        [Tooltip("機銃を主砲と一緒に上下させる（同軸機銃）")] public bool machineGunFollowsGun = true;
+        [HideInInspector] public bool machineGunFollowsGun = true;
+
+        [Header("武装（機銃・副砲塔）")]
+        public List<TankMachineGun> machineGuns = new List<TankMachineGun>();
+        public List<TankSecondaryTurret> secondaryTurrets = new List<TankSecondaryTurret>();
+
+        [Header("スナップ")]
+        [Tooltip("Scrap Mechanic のブロック 1 個の大きさ（m）")] public float blockSize = 0.25f;
 
         [Header("サスペンション（トーションバー）※m・度")]
         public bool suspension = true;

@@ -6,12 +6,12 @@ using UnityEngine;
 namespace TankRig.Editor
 {
     /// <summary>The steps behind the builder window: set up the rig root, place tracks and points, and finish (rig) the tank.</summary>
-    public static class TankRigBuilder
+    public static partial class TankRigBuilder
     {
-        public enum PointKind { Muzzle, MachineGun, Exhaust, Headlight, RearLight }
+        public enum PointKind { Muzzle, Exhaust, Headlight, RearLight }
 
         public static readonly PointKind[] AllPoints =
-            { PointKind.Muzzle, PointKind.MachineGun, PointKind.Exhaust, PointKind.Headlight, PointKind.RearLight };
+            { PointKind.Muzzle, PointKind.Exhaust, PointKind.Headlight, PointKind.RearLight };
 
         // ------------------------------------------------------------------ SMC-AD (optional, by reflection)
 
@@ -187,6 +187,7 @@ namespace TankRig.Editor
             s.gunAxisLocal = gun ? gun.InverseTransformDirection(gunAxisW).normalized : Vector3.right;
             s.axesFromJoints = HasJoint(turret) && HasJoint(gun);
             AutoPlacePoints(s, true);
+            if (gun) AddMachineGun(s, MachineGunMount.Coaxial);
             Undo.CollapseUndoOperations(group);
             return s;
         }
@@ -223,7 +224,6 @@ namespace TankRig.Editor
         public static string Label(PointKind k) => k switch
         {
             PointKind.Muzzle => "主砲の砲口",
-            PointKind.MachineGun => "機銃",
             PointKind.Exhaust => "エンジン排気",
             PointKind.Headlight => "前照灯",
             _ => "後部灯",
@@ -232,7 +232,6 @@ namespace TankRig.Editor
         static string ObjectName(PointKind k) => k switch
         {
             PointKind.Muzzle => "Muzzle",
-            PointKind.MachineGun => "MachineGun",
             PointKind.Exhaust => "Exhaust_L",
             PointKind.Headlight => "Headlight_L",
             _ => "RearLight_L",
@@ -241,7 +240,6 @@ namespace TankRig.Editor
         public static Transform GetPoint(TankRigSetup s, PointKind k) => k switch
         {
             PointKind.Muzzle => s.muzzle,
-            PointKind.MachineGun => s.machineGun,
             PointKind.Exhaust => s.exhaust,
             PointKind.Headlight => s.headlight,
             _ => s.rearLight,
@@ -282,7 +280,6 @@ namespace TankRig.Editor
             switch (k)
             {
                 case PointKind.Muzzle: s.muzzle = t; break;
-                case PointKind.MachineGun: s.machineGun = t; break;
                 case PointKind.Exhaust: s.exhaust = t; break;
                 case PointKind.Headlight: s.headlight = t; break;
                 default: s.rearLight = t; break;
@@ -304,9 +301,6 @@ namespace TankRig.Editor
             switch (k)
             {
                 case PointKind.Muzzle: return s.barrel ? s.barrel : s.gun ? s.gun : s.turret ? s.turret : s.hull; // moves with the recoil
-                case PointKind.MachineGun:
-                    if (s.machineGunFollowsGun && s.gun) return s.gun;
-                    return s.turret ? s.turret : s.hull;
                 default: return s.hull ? s.hull : s.transform;
             }
         }
@@ -347,7 +341,6 @@ namespace TankRig.Editor
             switch (k)
             {
                 case PointKind.Muzzle:
-                case PointKind.MachineGun:
                     return Quaternion.LookRotation(BarrelDirection(s), root.up);
                 case PointKind.Exhaust:
                     return Quaternion.LookRotation((root.up - root.forward * 0.35f).normalized, -root.forward);
@@ -421,10 +414,11 @@ namespace TankRig.Editor
                 Vector3 axisW = s.gun.TransformDirection(s.gunAxisLocal);
                 if (includeMuzzle && FindBarrelTip(s.barrel ? s.barrel : s.gun, s.gun.position, axisW, out var tip, out _))
                     PlacePoint(s, PointKind.Muzzle, tip);
-                Vector3 barrel = BarrelDirection(s);
-                float len = s.muzzle ? Vector3.Distance(s.muzzle.position, s.gun.position) : 2f;
-                PlacePoint(s, PointKind.MachineGun, s.gun.position + barrel * (len * 0.12f) + root.right * Mathf.Max(0.25f, lb.extents.x * 0.18f));
             }
+            // the machine guns that are already there move with the new front (coaxial ones along the barrel)
+            for (int i = 0; s.machineGuns != null && i < s.machineGuns.Count; i++)
+                if (s.machineGuns[i] != null && s.machineGuns[i].point)
+                    PlaceMachineGun(s, i, DefaultMachineGunPosition(s, s.machineGuns[i].mount, SameMountIndex(s, i)));
 
             Vector3 OnHull(Vector3 localFrom, Vector3 localDir, Vector3 fallbackLocal)
             {
@@ -624,7 +618,8 @@ namespace TankRig.Editor
             c.leftTrack = s.trackLeft ? s.trackLeft.GetComponent<TankTrack>() : null;
             c.rightTrack = s.trackRight ? s.trackRight.GetComponent<TankTrack>() : null;
             c.muzzle = s.muzzle;
-            c.machineGun = s.machineGun;
+            c.machineGun = null; // v0.7: machineGuns
+            c.machineGunTracer = c.machineGunFlash = null;
             c.exhausts = new[] { s.exhaust, s.mirrorExhaust ? s.exhaustMirror : null }.Where(t => t).ToArray();
             c.headlights = new[] { s.headlight, s.mirrorHeadlight ? s.headlightMirror : null }.Where(t => t).ToArray();
             c.rearLights = new[] { s.rearLight, s.mirrorRearLight ? s.rearLightMirror : null }.Where(t => t).ToArray();
@@ -670,12 +665,7 @@ namespace TankRig.Editor
                 c.muzzleSmoke = TankFxFactory.CreateMuzzleSmoke(s.muzzle);
                 c.muzzleLight = TankFxFactory.CreateFlashLight(s.muzzle);
             }
-            c.machineGunTracer = c.machineGunFlash = null;
-            if (s.machineGun)
-            {
-                c.machineGunTracer = TankFxFactory.CreateTracer(s.machineGun);
-                c.machineGunFlash = TankFxFactory.CreateSmallFlash(s.machineGun);
-            }
+            CompleteWeapons(s, c);
             TankFxFactory.CreateImpact(root, out var dust, out var sparks);
             c.impactDust = dust;
             c.impactSparks = sparks;
@@ -755,17 +745,19 @@ namespace TankRig.Editor
                 hull.sharedMaterial = mat;
             }
 
-            if (s.turret)
+            void TurretBox(Transform turret, string name)
             {
-                var tb = LocalBounds(s.turret, s.turret.GetComponents<Renderer>());
-                if (tb.size != Vector3.zero)
-                {
-                    var box = Make("Turret", s.turret).AddComponent<BoxCollider>();
-                    box.center = tb.center;
-                    box.size = tb.size;
-                    box.sharedMaterial = mat;
-                }
+                if (!turret) return;
+                var tb = LocalBounds(turret, turret.GetComponents<Renderer>());
+                if (tb.size == Vector3.zero) return;
+                var box = Make(name, turret).AddComponent<BoxCollider>();
+                box.center = tb.center;
+                box.size = tb.size;
+                box.sharedMaterial = mat;
             }
+            TurretBox(s.turret, "Turret");
+            for (int i = 0; c.secondaryTurrets != null && i < c.secondaryTurrets.Length; i++)
+                TurretBox(c.secondaryTurrets[i]?.turret, "SecondaryTurret_" + (i + 1));
 
             const float clearance = 0.15f; // above the ground at the static ride height ≈ the bump travel
             foreach (var (track, side) in new[] { (s.trackLeft, "Track_L"), (s.trackRight, "Track_R") })

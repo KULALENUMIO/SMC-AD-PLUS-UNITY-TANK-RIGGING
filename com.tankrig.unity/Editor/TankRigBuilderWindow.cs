@@ -1,3 +1,4 @@
+using System.Collections.Generic;
 using UnityEditor;
 using UnityEngine;
 
@@ -6,36 +7,57 @@ namespace TankRig.Editor
     /// <summary>
     /// Tools > Tank Rig > 戦車組み立てウィンドウ: pick hull / turret / gun, place the tracks (mirrored) and the effect points
     /// with the mouse in the Scene view, then rig the tank so it can be driven with WASD + mouse.
+    /// The steps are tabs; the finish buttons stay at the bottom whatever tab is open.
     /// </summary>
-    public class TankRigBuilderWindow : EditorWindow
+    public partial class TankRigBuilderWindow : EditorWindow
     {
         [MenuItem("Tools/Tank Rig/戦車組み立てウィンドウ", priority = 1)]
         public static void Open()
         {
             var w = GetWindow<TankRigBuilderWindow>("戦車組み立て");
-            w.minSize = new Vector2(380f, 520f);
+            w.minSize = new Vector2(380f, 480f);
             w.Show();
         }
 
-        enum FocusMode { None, Track, Point }
+        enum TargetKind { None, Track, Point, MachineGun, SecondaryMuzzle }
+
+        /// <summary>What the scene view handles edit (or what a click places).</summary>
+        struct Target
+        {
+            public TargetKind kind;
+            public TankRigBuilder.PointKind point;
+            public int index;
+            public static Target Track => new Target { kind = TargetKind.Track };
+            public static Target Point(TankRigBuilder.PointKind k) => new Target { kind = TargetKind.Point, point = k };
+            public static Target MachineGun(int i) => new Target { kind = TargetKind.MachineGun, index = i };
+            public static Target Secondary(int i) => new Target { kind = TargetKind.SecondaryMuzzle, index = i };
+            public bool Is(Target o) => kind == o.kind && (kind != TargetKind.Point || point == o.point) && index == o.index;
+        }
+
+        /// <summary>The steps, one tab each.</summary>
+        enum Page { Parts, Tracks, Suspension, Points, Weapons, Drive }
+        static readonly string[] PageLabels = { "① 部位", "② 履帯", "③ サスペンション", "④ ポイント", "⑤ 武装", "⑥ 走行・主砲" };
 
         GameObject model;
         Transform hull, turret, gun, barrel;
         bool flipForward;
-        TankRigSetup setup;
+        [SerializeField] TankRigSetup setup; // kept over script reloads / play mode
+        [SerializeField] Page page = Page.Tracks;
+        [SerializeField] TankRigBuilder.PointKind pointSel;
         Vector2 scroll;
         bool createGround = true, setupCamera = true, linkDetails, showArms = true;
+        bool trackFiles, trackNudge, finishOptions;
         float suspensionPreview;
-        TankRigBuilder.PointKind? placing;
-        FocusMode focus = FocusMode.Track;
-        TankRigBuilder.PointKind focusPoint;
+        Target? placing;
+        Target focus = Target.Track;
         string status;
-        GUIStyle sectionStyle, bigButton;
+        GUIStyle sectionStyle, bigButton, tabStyle;
 
         void OnEnable()
         {
             SceneView.duringSceneGui += OnSceneGUI;
             Selection.selectionChanged += OnSelectionChanged;
+            EditorApplication.playModeStateChanged += OnPlayModeChanged;
             OnSelectionChanged();
         }
 
@@ -43,8 +65,16 @@ namespace TankRig.Editor
         {
             SceneView.duringSceneGui -= OnSceneGUI;
             Selection.selectionChanged -= OnSelectionChanged;
+            EditorApplication.playModeStateChanged -= OnPlayModeChanged;
             placing = null;
             ResetPreview();
+            SetView(ViewMode.Free);
+        }
+
+        // the three-view is for editing: give the scene view back before playing
+        void OnPlayModeChanged(PlayModeStateChange change)
+        {
+            if (change == PlayModeStateChange.ExitingEditMode && (view != ViewMode.Free || ThreeViewHeld)) SetView(ViewMode.Free);
         }
 
         void OnSelectionChanged()
@@ -58,6 +88,21 @@ namespace TankRig.Editor
             Repaint();
         }
 
+        /// <summary>Edit <paramref name="t"/> with the scene handles and open the tab (and the entry) it belongs to.</summary>
+        void Select(Target t)
+        {
+            focus = t;
+            switch (t.kind)
+            {
+                case TargetKind.Track: page = Page.Tracks; break;
+                case TargetKind.Point: page = Page.Points; pointSel = t.point; break;
+                case TargetKind.MachineGun: page = Page.Weapons; weaponTab = 0; mgSel = t.index; break;
+                case TargetKind.SecondaryMuzzle: page = Page.Weapons; weaponTab = 1; stSel = t.index; break;
+            }
+            Repaint();
+            SceneView.RepaintAll();
+        }
+
         // ------------------------------------------------------------------ window
 
         void Styles()
@@ -65,6 +110,7 @@ namespace TankRig.Editor
             if (sectionStyle != null) return;
             sectionStyle = new GUIStyle(EditorStyles.boldLabel) { fontSize = 13 };
             bigButton = new GUIStyle(GUI.skin.button) { fontSize = 13, fontStyle = FontStyle.Bold };
+            tabStyle = new GUIStyle(EditorStyles.miniButton) { fixedHeight = 22f, fontSize = 11 };
         }
 
         void Section(string title)
@@ -75,36 +121,72 @@ namespace TankRig.Editor
             EditorGUI.DrawRect(r, new Color(0.5f, 0.5f, 0.5f, 0.5f));
         }
 
+        static void SubHeader(string title)
+        {
+            EditorGUILayout.Space(6f);
+            EditorGUILayout.LabelField(title, EditorStyles.boldLabel);
+        }
+
+        static void Line()
+        {
+            var r = EditorGUILayout.GetControlRect(false, 1f);
+            EditorGUI.DrawRect(r, new Color(0.5f, 0.5f, 0.5f, 0.5f));
+        }
+
         void OnGUI()
         {
             Styles();
-            scroll = EditorGUILayout.BeginScrollView(scroll);
-            EditorGUILayout.HelpBox("SMC-AD などで取り込んだ戦車に履帯を組み合わせ、WASD とマウスで操縦できる戦車にします。上から順に進めてください。", MessageType.None);
-
             bool playing = EditorApplication.isPlayingOrWillChangePlaymode;
+            // no tank to edit (scene changed, play mode...) but still holding the scene view in three-view: give it back
+            if ((!setup || playing) && (view != ViewMode.Free || ThreeViewHeld)) SetView(ViewMode.Free);
             if (playing)
                 EditorGUILayout.HelpBox("プレイ中は組み立てできません（変更はプレイ終了で消えるため）。■ で止めてから操作してください。", MessageType.Warning);
             using (new EditorGUI.DisabledScope(playing))
             {
-                if (!setup) DrawStart();
+                if (!setup)
+                {
+                    scroll = EditorGUILayout.BeginScrollView(scroll);
+                    EditorGUILayout.HelpBox("SMC-AD などで取り込んだ戦車に履帯を組み合わせ、WASD とマウスで操縦できる戦車にします。", MessageType.None);
+                    DrawStart();
+                    EditorGUILayout.Space(12f);
+                    EditorGUILayout.EndScrollView();
+                }
                 else
                 {
+                    TankRigBuilder.Migrate(setup);
                     DrawHeader();
-                    DrawTracks();
-                    DrawSuspension();
-                    DrawPoints();
-                    DrawSettings();
+                    DrawPageTabs();
+                    scroll = EditorGUILayout.BeginScrollView(scroll);
+                    EditorGUILayout.Space(4f);
+                    switch (page)
+                    {
+                        case Page.Parts: DrawParts(); break;
+                        case Page.Tracks: DrawTracks(); break;
+                        case Page.Suspension: DrawSuspension(); break;
+                        case Page.Points: DrawPoints(); break;
+                        case Page.Weapons: DrawWeapons(); break;
+                        case Page.Drive: DrawSettings(); break;
+                    }
+                    EditorGUILayout.Space(8f);
+                    EditorGUILayout.EndScrollView();
                     DrawFinish();
                 }
             }
-            if (!string.IsNullOrEmpty(status)) EditorGUILayout.HelpBox(status, MessageType.Info);
-            EditorGUILayout.Space(12f);
-            EditorGUILayout.EndScrollView();
+            if (!string.IsNullOrEmpty(status))
+            {
+                using (new EditorGUILayout.HorizontalScope())
+                {
+                    EditorGUILayout.HelpBox(status, MessageType.Info);
+                    if (GUILayout.Button(new GUIContent("×", "このメッセージを消す"), GUILayout.Width(22f))) status = null;
+                }
+            }
         }
+
+        // ------------------------------------------------------------------ start
 
         void DrawStart()
         {
-            Section("① 戦車モデルと部位");
+            Section("戦車モデルと部位");
             EditorGUI.BeginChangeCheck();
             model = (GameObject)EditorGUILayout.ObjectField("戦車モデル", model, typeof(GameObject), true);
             if (EditorGUI.EndChangeCheck() && model && !EditorUtility.IsPersistent(model))
@@ -143,7 +225,7 @@ namespace TankRig.Editor
             string barrelProblem = TankRigBuilder.BarrelProblem(gun, barrel);
             if (barrelProblem != null) EditorGUILayout.HelpBox(barrelProblem, MessageType.Error);
             else if (gun && !barrel) EditorGUILayout.HelpBox("砲身なし: 発砲しても砲身は後退しません（車体の反動・発砲炎はあります）。", MessageType.None);
-            flipForward = EditorGUILayout.ToggleLeft("前後を反転する（前方向は主砲の向きから自動で決まります）", flipForward);
+            flipForward = EditorGUILayout.ToggleLeft(new GUIContent("前後を反転する", "前方向は主砲の向きから自動で決まります。逆になるときだけオンにします"), flipForward);
 
             EditorGUILayout.Space(6f);
             using (new EditorGUI.DisabledScope(!model || !hull || !gun || barrelProblem != null))
@@ -153,20 +235,64 @@ namespace TankRig.Editor
                     setup = TankRigBuilder.CreateSetup(model, hull, turret, gun, barrel, flipForward);
                     AutoAssignTrackAssets();
                     Selection.activeGameObject = setup.gameObject;
-                    status = "組み立て用のルート「" + setup.name + "」を作り、各ポイントを仮配置しました。次は履帯です。";
+                    page = Page.Tracks;
+                    status = "組み立て用のルート「" + setup.name + "」を作り、各ポイントを仮配置しました。次は「② 履帯」です。";
                     SceneView.lastActiveSceneView?.FrameSelected();
                 }
             }
         }
 
+        // ------------------------------------------------------------------ header and tabs
+
+        /// <summary>The tank being built and the scene view tools (used by several tabs), then the step tabs.</summary>
         void DrawHeader()
         {
-            Section("戦車");
+            EditorGUILayout.Space(2f);
             using (new EditorGUI.DisabledScope(true))
                 EditorGUILayout.ObjectField("組み立て中", setup, typeof(TankRigSetup), true);
-            EditorGUILayout.LabelField("回転軸", setup.axesFromJoints ? "SMC-AD のジョイントから取得" : "形から推定");
+            DrawEditTools();
+        }
+
+        string PageMark(Page p)
+        {
+            switch (p)
+            {
+                case Page.Parts: return setup.gun ? "" : " ⚠";
+                case Page.Tracks: return setup.trackLeft ? " ✔" : "";
+                case Page.Weapons:
+                    foreach (var st in setup.secondaryTurrets)
+                        if (st != null && TankRigBuilder.SecondaryProblems(setup, st).Count > 0) return " ⚠";
+                    return "";
+                default: return "";
+            }
+        }
+
+        void DrawPageTabs()
+        {
+            EditorGUILayout.Space(4f);
+            var labels = new GUIContent[PageLabels.Length];
+            for (int i = 0; i < labels.Length; i++) labels[i] = new GUIContent(PageLabels[i] + PageMark((Page)i));
+            int p = GUILayout.SelectionGrid((int)page, labels, 3, tabStyle);
+            if (p != (int)page)
+            {
+                page = (Page)p;
+                placing = null;
+                scroll = Vector2.zero;
+                GUI.FocusControl(null);
+            }
+            Line();
+        }
+
+        // ------------------------------------------------------------------ ① parts
+
+        void DrawParts()
+        {
             using (new EditorGUI.DisabledScope(true))
+            {
+                EditorGUILayout.ObjectField("車体", setup.hull, typeof(Transform), true);
+                EditorGUILayout.ObjectField("砲塔", setup.turret, typeof(Transform), true);
                 EditorGUILayout.ObjectField(new GUIContent("砲座（上下）"), setup.gun, typeof(Transform), true);
+            }
             EditorGUI.BeginChangeCheck();
             var b = (Transform)EditorGUILayout.ObjectField(new GUIContent("砲身（後退）", "なくても可。指定しないと発砲時の後退は起きません"), setup.barrel, typeof(Transform), true);
             if (EditorGUI.EndChangeCheck())
@@ -175,17 +301,32 @@ namespace TankRig.Editor
                 status = problem ?? (b ? "砲身を指定しました。砲口は砲身と一緒に動きます。反映するには「戦車を完成させる」を押してください。"
                                        : "砲身を外しました（発砲時の後退なし）。反映するには「戦車を完成させる」を押してください。");
             }
+            EditorGUILayout.LabelField("回転軸", setup.axesFromJoints ? "SMC-AD のジョイントから取得" : "形から推定");
             if (!setup.gun) EditorGUILayout.HelpBox("砲座がありません。「別の戦車を組み立てる」から砲座を指定し直してください。", MessageType.Warning);
             else if (!setup.barrel) EditorGUILayout.HelpBox("砲身なし: 発砲しても砲身は後退しません。", MessageType.None);
+
+            EditorGUILayout.Space(4f);
+            EditorGUI.BeginChangeCheck();
+            float bs = EditorGUILayout.FloatField(new GUIContent("ブロックの大きさ（m）", "スナップ・三面図のグリッドの単位。Scrap Mechanic のブロック 1 個 = 0.25 m"), setup.blockSize);
+            if (EditorGUI.EndChangeCheck())
+            {
+                Undo.RecordObject(setup, "ブロックの大きさ");
+                setup.blockSize = Mathf.Max(0.01f, bs);
+                TankRigBuilder.ResetGrid(setup);
+                SceneView.RepaintAll();
+            }
+
+            EditorGUILayout.Space(6f);
             using (new EditorGUILayout.HorizontalScope())
             {
-                if (GUILayout.Button("前後を反転"))
+                if (GUILayout.Button(new GUIContent("前後を反転", "前方向が逆のとき。ポイントも置き直します")))
                 {
                     TankRigBuilder.FlipForward(setup);
                     status = "前後を反転し、ポイントを置き直しました。";
                 }
-                if (GUILayout.Button("別の戦車を組み立てる"))
+                if (GUILayout.Button(new GUIContent("別の戦車を組み立てる", "この戦車はそのまま残して、最初の画面に戻ります")))
                 {
+                    SetView(ViewMode.Free);
                     setup = null;
                     model = null;
                     hull = turret = gun = barrel = null;
@@ -194,6 +335,8 @@ namespace TankRig.Editor
                 }
             }
         }
+
+        // ------------------------------------------------------------------ ② tracks
 
         void AutoAssignTrackAssets()
         {
@@ -204,35 +347,6 @@ namespace TankRig.Editor
             if (!setup.linkAsset) setup.linkAsset = TankRigAssets.LoadTrack("TankTrack_Link");
         }
 
-        /// <summary>One button per track link design (all share the same pitch / width, so they can be swapped at any time).</summary>
-        void DrawLinkDesigns()
-        {
-            var designs = TankRigAssets.LinkDesigns();
-            if (designs.Count == 0) return;
-            EditorGUILayout.LabelField("履帯のデザイン");
-            int current = designs.FindIndex(d => d.asset == setup.linkAsset);
-            const int perRow = 3;
-            for (int row = 0; row < designs.Count; row += perRow)
-            {
-                using (new EditorGUILayout.HorizontalScope())
-                {
-                    for (int i = row; i < Mathf.Min(row + perRow, designs.Count); i++)
-                    {
-                        bool on = i == current;
-                        bool now = GUILayout.Toggle(on, designs[i].label, EditorStyles.miniButton, GUILayout.Height(22f));
-                        if (now && !on)
-                        {
-                            TankRigBuilder.SetLinkDesign(setup, designs[i].asset);
-                            status = "履帯のデザインを「" + designs[i].label + "」にしました。";
-                            SceneView.RepaintAll();
-                        }
-                    }
-                }
-            }
-            if (designs.Count < TankRigAssets.BuiltInLinks.Length)
-                EditorGUILayout.HelpBox("取り込まれていないデザインがあります。「同梱の履帯を取り込む」を押すと全部使えるようになります。", MessageType.None);
-        }
-
         void ImportTracksFrom(string src)
         {
             int n = TankRigAssets.ImportTracks(src);
@@ -240,66 +354,119 @@ namespace TankRig.Editor
             status = n > 0 ? $"履帯の FBX を {n} 個取り込みました（{TankRigAssets.TrackFolder}）。" : "FBX が見つかりませんでした: " + src;
         }
 
+        /// <summary>Wheel set: 6 or 7 road wheels (or another FBX given below).</summary>
+        void DrawWheelSet()
+        {
+            var six = TankRigAssets.LoadTrack("TankTrack_6W");
+            var seven = TankRigAssets.LoadTrack("TankTrack_7W");
+            var options = new List<string> { "6 輪", "7 輪" };
+            int cur = setup.trackAsset && setup.trackAsset == six ? 0 : setup.trackAsset && setup.trackAsset == seven ? 1 : -1;
+            if (cur < 0)
+            {
+                options.Add(setup.trackAsset ? "その他: " + setup.trackAsset.name : "（未指定）");
+                cur = 2;
+            }
+            int n = EditorGUILayout.Popup(new GUIContent("転輪", "転輪の数。自作の FBX は「FBX の指定・取り込み」から"), cur, options.ToArray());
+            if (n == cur || n > 1) return;
+            var asset = n == 0 ? six : seven;
+            if (!asset)
+            {
+                status = "その転輪の FBX が取り込まれていません。「FBX の指定・取り込み」の「同梱の履帯を取り込む」を押してください。";
+                return;
+            }
+            Undo.RecordObject(setup, "履帯の指定");
+            setup.trackAsset = asset;
+            if (!setup.linkAsset) setup.linkAsset = TankRigAssets.LoadTrack("TankTrack_Link");
+            if (setup.trackLeft) TankRigBuilder.PlaceTracks(setup, false);
+        }
+
+        /// <summary>Track link design (all share the same pitch / width, so they can be swapped at any time).</summary>
+        void DrawLinkDesigns()
+        {
+            var designs = TankRigAssets.LinkDesigns();
+            var labels = new List<string>();
+            int current = -1;
+            for (int i = 0; i < designs.Count; i++)
+            {
+                labels.Add(designs[i].label);
+                if (designs[i].asset == setup.linkAsset) current = i;
+            }
+            if (current < 0)
+            {
+                labels.Add(setup.linkAsset ? "その他: " + setup.linkAsset.name : "（未指定）");
+                current = labels.Count - 1;
+            }
+            int n = EditorGUILayout.Popup(new GUIContent("履帯のデザイン", "どれも同じ規格なので、配置した後でもいつでも切り替えられます"), current, labels.ToArray());
+            if (n != current && n < designs.Count)
+            {
+                TankRigBuilder.SetLinkDesign(setup, designs[n].asset);
+                status = "履帯のデザインを「" + designs[n].label + "」にしました。";
+                SceneView.RepaintAll();
+            }
+            if (designs.Count < TankRigAssets.BuiltInLinks.Length)
+                EditorGUILayout.HelpBox("取り込まれていないデザインがあります。「FBX の指定・取り込み」の「同梱の履帯を取り込む」で全部使えるようになります。", MessageType.None);
+        }
+
+        void DrawTrackFiles()
+        {
+            trackFiles = EditorGUILayout.Foldout(trackFiles, "FBX の指定・取り込み", true);
+            if (!trackFiles) return;
+            using (new EditorGUI.IndentLevelScope())
+            {
+                EditorGUI.BeginChangeCheck();
+                var ta = (GameObject)EditorGUILayout.ObjectField("転輪一式（FBX）", setup.trackAsset, typeof(GameObject), false);
+                var la = (GameObject)EditorGUILayout.ObjectField("履帯リンク（FBX）", setup.linkAsset, typeof(GameObject), false);
+                if (EditorGUI.EndChangeCheck())
+                {
+                    Undo.RecordObject(setup, "履帯の指定");
+                    setup.trackAsset = ta;
+                    if (la != setup.linkAsset)
+                    {
+                        if (la && setup.trackLeft) TankRigBuilder.SetLinkDesign(setup, la);
+                        else setup.linkAsset = la;
+                    }
+                }
+                using (new EditorGUILayout.HorizontalScope())
+                {
+                    GUILayout.Space(EditorGUI.indentLevel * 15f);
+                    if (GUILayout.Button(new GUIContent("同梱の履帯を取り込む", "パッケージに入っている転輪・履帯の FBX を " + TankRigAssets.TrackFolder + " にコピーし直します")))
+                        ImportTracksFrom(TankRigAssets.DefaultSourceFolder());
+                    if (GUILayout.Button(new GUIContent("フォルダから…", "自分で作った履帯の FBX（TankTrack_*.fbx）があるフォルダを選んで取り込みます")))
+                    {
+                        string src = EditorUtility.OpenFolderPanel("履帯の FBX があるフォルダ", "", "");
+                        if (!string.IsNullOrEmpty(src)) ImportTracksFrom(src);
+                    }
+                }
+            }
+        }
+
         void DrawTracks()
         {
-            Section("② 履帯");
-            EditorGUI.BeginChangeCheck();
-            var ta = (GameObject)EditorGUILayout.ObjectField("転輪一式（FBX）", setup.trackAsset, typeof(GameObject), false);
-            var la = (GameObject)EditorGUILayout.ObjectField("履帯リンク（FBX）", setup.linkAsset, typeof(GameObject), false);
-            if (EditorGUI.EndChangeCheck())
-            {
-                Undo.RecordObject(setup, "履帯の指定");
-                setup.trackAsset = ta;
-                if (la != setup.linkAsset)
-                {
-                    if (la && setup.trackLeft) TankRigBuilder.SetLinkDesign(setup, la);
-                    else setup.linkAsset = la;
-                }
-            }
+            DrawWheelSet();
             DrawLinkDesigns();
+            DrawTrackFiles();
 
-            using (new EditorGUILayout.HorizontalScope())
-            {
-                foreach (var n in new[] { "6W", "7W" })
-                {
-                    var asset = TankRigAssets.LoadTrack("TankTrack_" + n);
-                    using (new EditorGUI.DisabledScope(!asset))
-                        if (GUILayout.Button(n == "6W" ? "6輪" : "7輪"))
-                        {
-                            Undo.RecordObject(setup, "履帯の指定");
-                            setup.trackAsset = asset;
-                            if (!setup.linkAsset) setup.linkAsset = TankRigAssets.LoadTrack("TankTrack_Link");
-                            if (setup.trackLeft) TankRigBuilder.PlaceTracks(setup, false);
-                        }
-                }
-                if (GUILayout.Button(new GUIContent("同梱の履帯を取り込む", "パッケージに入っている転輪・履帯の FBX を " + TankRigAssets.TrackFolder + " にコピーし直します")))
-                    ImportTracksFrom(TankRigAssets.DefaultSourceFolder());
-                if (GUILayout.Button(new GUIContent("フォルダから…", "自分で作った履帯の FBX（TankTrack_*.fbx）があるフォルダを選んで取り込みます"), GUILayout.Width(84f)))
-                {
-                    string src = EditorUtility.OpenFolderPanel("履帯の FBX があるフォルダ", "", "");
-                    if (!string.IsNullOrEmpty(src)) ImportTracksFrom(src);
-                }
-            }
-
+            EditorGUILayout.Space(4f);
             using (new EditorGUI.DisabledScope(!setup.trackAsset || !setup.linkAsset))
             {
                 if (GUILayout.Button(setup.trackLeft ? "履帯を置き直す（自動フィット）" : "履帯を配置する（自動フィット）", GUILayout.Height(26f)))
                 {
                     TankRigBuilder.PlaceTracks(setup, true);
-                    focus = FocusMode.Track;
+                    if (SnapStep > 0f) TankRigBuilder.SnapTrack(setup, SnapStep);
+                    Select(Target.Track);
                     status = "左右の履帯を置きました。シーンビューで左の履帯を動かすと、右も左右対称に動きます。";
-                    SceneView.RepaintAll();
                 }
             }
             if (!setup.trackLeft) return;
 
+            SubHeader("位置と大きさ");
             EditorGUI.BeginChangeCheck();
             var o = setup.trackOffset;
             float x = EditorGUILayout.Slider("左右の間隔（片側）", o.x, 0f, 6f);
             float y = EditorGUILayout.Slider("高さ", o.y, -5f, 5f);
             float z = EditorGUILayout.Slider("前後", o.z, -8f, 8f);
             float sc = EditorGUILayout.Slider("大きさ", setup.trackScale, 0.2f, 4f);
-            float th = EditorGUILayout.Slider("厚さ（倍率）", setup.trackThickness, 0.3f, 3f);
+            float th = EditorGUILayout.Slider(new GUIContent("厚さ（倍率）", "車軸方向だけの倍率"), setup.trackThickness, 0.3f, 3f);
             if (EditorGUI.EndChangeCheck())
             {
                 Undo.RecordObject(setup, "履帯の調整");
@@ -310,13 +477,16 @@ namespace TankRig.Editor
                 setup.trackScale = sc;
                 setup.trackThickness = th;
                 setup.ApplyTrackPose();
+                if (SnapStep > 0f && !scaleChanged) TankRigBuilder.SnapTrack(setup, SnapStep);
                 if (scaleChanged) TankRigBuilder.ApplyTrackSettings(setup, suspensionPreview); // metres → new local units
                 SceneView.RepaintAll();
             }
             using (new EditorGUILayout.HorizontalScope())
             {
-                if (GUILayout.Button(focus == FocusMode.Track ? "● シーンで履帯を動かす" : "シーンで履帯を動かす")) { focus = FocusMode.Track; SceneView.RepaintAll(); }
-                if (GUILayout.Button("自動フィットし直す"))
+                bool moving = focus.kind == TargetKind.Track;
+                if (GUILayout.Button(new GUIContent(moving ? "● シーンで動かしています" : "シーンで履帯を動かす", "シーンビューに左の履帯の移動ハンドルを出します（右は左右対称に動きます）")))
+                    Select(Target.Track);
+                if (GUILayout.Button(new GUIContent("自動フィットし直す", "車体の大きさに合わせて位置と大きさを決め直します")))
                 {
                     TankRigBuilder.RecordTrackTransforms(setup, "履帯の自動フィット");
                     TankRigBuilder.AutoFitTracks(setup);
@@ -327,39 +497,49 @@ namespace TankRig.Editor
             var tt = setup.trackLeft.GetComponent<TankTrack>();
             if (tt) EditorGUILayout.LabelField("リンク", $"片側 {tt.LinkCount} 枚 / 一周 {tt.PathLength * setup.trackScale:0.00} m");
 
-            linkDetails = EditorGUILayout.Foldout(linkDetails, "リンクの詳細");
+            trackNudge = EditorGUILayout.Foldout(trackNudge, "ブロック単位で動かす", true);
+            if (trackNudge)
+                using (new EditorGUI.IndentLevelScope())
+                    DrawTrackNudge();
+
+            linkDetails = EditorGUILayout.Foldout(linkDetails, "リンクの詳細（ピッチ・ピンの位置）", true);
             if (linkDetails)
             {
-                EditorGUI.BeginChangeCheck();
-                float pitch = EditorGUILayout.FloatField("ピッチ（リンクの間隔）", setup.linkPitch);
-                float off = EditorGUILayout.FloatField("転輪表面からピンまで", setup.linkPitchLineOffset);
-                float depth = EditorGUILayout.FloatField("ピンから接地面まで", setup.linkGroundDepth);
-                if (EditorGUI.EndChangeCheck())
+                using (new EditorGUI.IndentLevelScope())
                 {
-                    Undo.RecordObject(setup, "リンクの設定");
-                    setup.linkPitch = Mathf.Max(0.02f, pitch);
-                    setup.linkPitchLineOffset = off;
-                    setup.linkGroundDepth = Mathf.Max(0f, depth);
-                    TankRigBuilder.RefreshTracks(setup);
+                    EditorGUI.BeginChangeCheck();
+                    float pitch = EditorGUILayout.FloatField("ピッチ（リンクの間隔）", setup.linkPitch);
+                    float off = EditorGUILayout.FloatField("転輪表面からピンまで", setup.linkPitchLineOffset);
+                    float depth = EditorGUILayout.FloatField("ピンから接地面まで", setup.linkGroundDepth);
+                    if (EditorGUI.EndChangeCheck())
+                    {
+                        Undo.RecordObject(setup, "リンクの設定");
+                        setup.linkPitch = Mathf.Max(0.02f, pitch);
+                        setup.linkPitchLineOffset = off;
+                        setup.linkGroundDepth = Mathf.Max(0f, depth);
+                        TankRigBuilder.RefreshTracks(setup);
+                    }
                 }
             }
         }
 
+        // ------------------------------------------------------------------ ③ suspension
+
         void DrawSuspension()
         {
-            Section("②' サスペンション（トーションバー）");
-            EditorGUILayout.HelpBox("いまの転輪の位置が「地面に置いたときの静止位置」です。荷重がないと少し下がりながら後ろへ弧を描き、押されると上がります。履帯は伸び切ったときにピンと張る長さなので、静止時は上側が少したわみます。", MessageType.None);
             EditorGUI.BeginChangeCheck();
-            bool on = EditorGUILayout.ToggleLeft("サスペンションを使う", setup.suspension);
+            bool on = EditorGUILayout.ToggleLeft(new GUIContent("サスペンション（トーションバー）を使う",
+                "いまの転輪の位置が「地面に置いたときの静止位置」です。荷重がないと少し下がりながら後ろへ弧を描き、押されると上がります。" +
+                "履帯は伸び切ったときにピンと張る長さなので、静止時は上側が少したわみます。"), setup.suspension);
             float droop, bump, arm, angle, sag, sway;
             using (new EditorGUI.DisabledScope(!on))
             {
-                droop = EditorGUILayout.Slider("伸び（荷重なし, m）", setup.suspensionDroop, 0f, 0.4f);
-                bump = EditorGUILayout.Slider("縮み（m）", setup.suspensionBump, 0f, 0.5f);
-                arm = EditorGUILayout.Slider("アームの長さ（m）", setup.armLength, 0.1f, 1.5f);
+                droop = EditorGUILayout.Slider(new GUIContent("伸び（荷重なし, m）", "荷重がないときに転輪が下がる量"), setup.suspensionDroop, 0f, 0.4f);
+                bump = EditorGUILayout.Slider(new GUIContent("縮み（m）", "押されたときに転輪が上がる量"), setup.suspensionBump, 0f, 0.5f);
+                arm = EditorGUILayout.Slider(new GUIContent("アームの長さ（m）", "支点は転輪の後ろ側"), setup.armLength, 0.1f, 1.5f);
                 angle = EditorGUILayout.Slider("アームの角度（度）", setup.armAngle, 0f, 45f);
                 sag = EditorGUILayout.Slider("履帯のたわみの上限（m）", setup.maxSag, 0f, 0.4f);
-                sway = EditorGUILayout.Slider("車体の揺れ", setup.bodySway, 0f, 3f);
+                sway = EditorGUILayout.Slider(new GUIContent("車体の揺れ", "加減速・旋回での車体の傾きの強さ（0 で傾かない）"), setup.bodySway, 0f, 3f);
             }
             if (EditorGUI.EndChangeCheck())
             {
@@ -374,8 +554,14 @@ namespace TankRig.Editor
                 TankRigBuilder.ApplyTrackSettings(setup, suspensionPreview);
                 SceneView.RepaintAll();
             }
-            if (!setup.trackLeft || !setup.suspension) return;
+            if (!setup.trackLeft)
+            {
+                EditorGUILayout.HelpBox("履帯を置くと、ここで動きを確かめられます。", MessageType.None);
+                return;
+            }
+            if (!setup.suspension) return;
 
+            SubHeader("確認");
             EditorGUI.BeginChangeCheck();
             float p = EditorGUILayout.Slider("プレビュー（縮み ← 静止 → 伸び）", suspensionPreview, -1f, 1f);
             if (EditorGUI.EndChangeCheck())
@@ -389,7 +575,12 @@ namespace TankRig.Editor
                 EditorGUILayout.LabelField("履帯のたわみ", tt.CurrentSag > 1e-4f
                     ? $"{tt.CurrentSag * setup.trackScale * 100f:0.0} cm"
                     : "なし（ピンと張っています）");
-            showArms = EditorGUILayout.ToggleLeft("シーンビューにアームの動き（弧）を表示", showArms);
+            bool arms = EditorGUILayout.ToggleLeft("シーンビューにアームの動き（弧）を表示", showArms);
+            if (arms != showArms)
+            {
+                showArms = arms;
+                SceneView.RepaintAll();
+            }
         }
 
         void ResetPreview()
@@ -399,69 +590,99 @@ namespace TankRig.Editor
             TankRigBuilder.ApplyTrackSettings(setup, 0f);
         }
 
+        // ------------------------------------------------------------------ ④ points
+
         void DrawPoints()
         {
-            Section("③ ポイント（シーンビューでクリックして配置）");
-            EditorGUILayout.HelpBox("「クリックで配置」を押してからシーンビューで戦車の表面をクリックします。置いた後は矢印で動かせます。向きは回転ツール（E キー）で変えられます。", MessageType.None);
-            foreach (var k in TankRigBuilder.AllPoints) PointRow(k);
-
-            EditorGUI.BeginChangeCheck();
-            bool coax = EditorGUILayout.ToggleLeft("機銃を砲座と一緒に上下させる（同軸機銃）", setup.machineGunFollowsGun);
-            if (EditorGUI.EndChangeCheck())
+            EditorGUILayout.HelpBox("ポイントを選んで「クリックで配置」を押し、シーンビューで戦車の表面をクリックします。置いた後は矢印で移動、回転ツール（E）で向きを変えられます。機銃は「⑤ 武装」にあります。", MessageType.None);
+            var kinds = TankRigBuilder.AllPoints;
+            var labels = new string[kinds.Length];
+            int cur = 0;
+            for (int i = 0; i < kinds.Length; i++)
             {
-                Undo.RecordObject(setup, "同軸機銃");
-                setup.machineGunFollowsGun = coax;
-                if (setup.machineGun) Undo.SetTransformParent(setup.machineGun, TankRigBuilder.PointParent(setup, TankRigBuilder.PointKind.MachineGun), "同軸機銃");
+                labels[i] = (TankRigBuilder.GetPoint(setup, kinds[i]) ? "✔ " : "－ ") + TankRigBuilder.Label(kinds[i]);
+                if (kinds[i] == pointSel) cur = i;
             }
-            if (GUILayout.Button("すべて自動で仮配置し直す"))
+            int n = EditorGUILayout.Popup(new GUIContent("ポイント", "✔ = 配置済み"), cur, labels);
+            if (n != cur)
+            {
+                pointSel = kinds[n];
+                placing = null;
+                if (TankRigBuilder.GetPoint(setup, pointSel)) Select(Target.Point(pointSel));
+            }
+            var k = pointSel;
+            var t = TankRigBuilder.GetPoint(setup, k);
+            using (new EditorGUILayout.HorizontalScope())
+            {
+                EditorGUILayout.PrefixLabel(" ");
+                PlaceButtons(Target.Point(k), t);
+            }
+            if (TankRigBuilder.CanMirror(k))
+            {
+                bool m = TankRigBuilder.IsMirrored(setup, k);
+                bool nm = EditorGUILayout.Toggle(new GUIContent("左右対称", "反対側にも同じポイントを自動で置きます"), m);
+                if (nm != m)
+                {
+                    TankRigBuilder.SetMirrored(setup, k, nm);
+                    SceneView.RepaintAll();
+                }
+            }
+            EditorGUILayout.Space(8f);
+            if (GUILayout.Button(new GUIContent("すべて自動で仮配置し直す", "砲口・排気・ライト・機銃を、モデルの形から置き直します")))
             {
                 TankRigBuilder.AutoPlacePoints(setup, true);
                 SceneView.RepaintAll();
             }
         }
 
-        void PointRow(TankRigBuilder.PointKind k)
+        /// <summary>「クリックで配置」 and 「選ぶ」 for one target.</summary>
+        void PlaceButtons(Target target, Transform current)
         {
-            var t = TankRigBuilder.GetPoint(setup, k);
-            using (new EditorGUILayout.HorizontalScope())
+            bool active = placing.HasValue && placing.Value.Is(target);
+            var bg = GUI.backgroundColor;
+            if (active) GUI.backgroundColor = new Color(0.4f, 1f, 0.5f);
+            if (GUILayout.Button(new GUIContent(active ? "クリック待ち…" : "クリックで配置", "押してからシーンビューで戦車の表面をクリックします（Esc で中止）")))
             {
-                EditorGUILayout.LabelField((t ? "✔ " : "－ ") + TankRigBuilder.Label(k), GUILayout.Width(120f));
-                bool active = placing == k;
-                var bg = GUI.backgroundColor;
-                if (active) GUI.backgroundColor = new Color(0.4f, 1f, 0.5f);
-                if (GUILayout.Button(active ? "クリック待ち…" : "クリックで配置"))
-                {
-                    placing = active ? (TankRigBuilder.PointKind?)null : k;
-                    SceneView.lastActiveSceneView?.Focus();
-                }
-                GUI.backgroundColor = bg;
-                using (new EditorGUI.DisabledScope(!t))
-                    if (GUILayout.Button("選ぶ", GUILayout.Width(44f)))
-                    {
-                        focus = FocusMode.Point;
-                        focusPoint = k;
-                        SceneView.RepaintAll();
-                    }
-                if (TankRigBuilder.CanMirror(k))
-                {
-                    bool m = TankRigBuilder.IsMirrored(setup, k);
-                    bool nm = GUILayout.Toggle(m, "左右対称", GUILayout.Width(72f));
-                    if (nm != m) TankRigBuilder.SetMirrored(setup, k, nm);
-                }
-                else GUILayout.Space(76f);
+                placing = active ? (Target?)null : target;
+                SceneView.lastActiveSceneView?.Focus();
             }
+            GUI.backgroundColor = bg;
+            bool focused = focus.Is(target);
+            using (new EditorGUI.DisabledScope(!current))
+                if (GUILayout.Button(new GUIContent(focused ? "● 選択中" : "選ぶ", "シーンビューに移動・回転のハンドルを出します"), GUILayout.Width(64f)))
+                    Select(target);
         }
+
+        // ------------------------------------------------------------------ ⑥ drive and main gun
 
         void DrawSettings()
         {
-            Section("④ 走行・武装");
             EditorGUI.BeginChangeCheck();
+            int mode = EditorGUILayout.Popup(new GUIContent("走行方式"), setup.physicsDrive ? 0 : 1,
+                new[] { "物理演算（車体だけ。履帯は描画）", "物理なし（軽い。AI の大量配置向け）" });
+            float tons = setup.massTons;
+            if (mode == 0) tons = EditorGUILayout.Slider("車重（トン）", setup.massTons, 1f, 120f);
+            if (EditorGUI.EndChangeCheck())
+            {
+                Undo.RecordObject(setup, "物理演算の設定");
+                setup.physicsDrive = mode == 0;
+                setup.massTons = tons;
+            }
+            EditorGUILayout.HelpBox(setup.physicsDrive
+                ? "転輪ごとのトーションバーが車体を支え、左右の履帯の駆動力で走ります。坂・段差・障害物・反動が車体の動きに出ます。"
+                : "物理演算なし：地面に沿って滑らかに動きます。", MessageType.None);
+            if (setup.physicsDrive && (!setup.trackLeft || !setup.suspension))
+                EditorGUILayout.HelpBox("物理演算の走行は転輪のサスペンションで車体を押すので、履帯がない・サスペンションを使わないときは自動で「物理なし」になります。", MessageType.Warning);
+
+            EditorGUI.BeginChangeCheck();
+            SubHeader("走行");
             float maxSpeed = EditorGUILayout.Slider("最高速度（km/h）", setup.maxSpeedKmh, 5f, 120f);
             float rev = EditorGUILayout.Slider("後退速度（km/h）", setup.reverseSpeedKmh, 2f, 60f);
             float acc = EditorGUILayout.Slider("加速（m/s²）", setup.acceleration, 0.5f, 15f);
-            float brk = EditorGUILayout.Slider("ブレーキ（m/s²、キーを離すと止まる）", setup.braking, 1f, 20f);
-            float resp = EditorGUILayout.Slider("操作の反応（大きいほどキビキビ）", setup.responsiveness, 0.3f, 3f);
+            float brk = EditorGUILayout.Slider(new GUIContent("ブレーキ（m/s²）", "W / S を離すとこの強さで止まります（実際は履帯の摩擦が上限）"), setup.braking, 1f, 20f);
+            float resp = EditorGUILayout.Slider(new GUIContent("操作の反応", "大きいほどキビキビ（1 = 標準）"), setup.responsiveness, 0.3f, 3f);
             float turn = EditorGUILayout.Slider("車体の旋回（度/秒）", setup.turnRate, 5f, 120f);
+            SubHeader("主砲");
             float trav = EditorGUILayout.Slider("砲塔の旋回（度/秒）", setup.traverseSpeed, 2f, 120f);
             float minE = setup.minElevation, maxE = setup.maxElevation;
             EditorGUILayout.MinMaxSlider($"俯仰角 {minE:0}°〜{maxE:0}°", ref minE, ref maxE, -30f, 70f);
@@ -482,49 +703,42 @@ namespace TankRig.Editor
                 setup.reloadTime = reload;
                 setup.gunPower = power;
             }
-
-            EditorGUILayout.Space(4f);
-            EditorGUI.BeginChangeCheck();
-            bool phys = EditorGUILayout.ToggleLeft("物理演算で走る（車体だけ。履帯は描画で地形に沿わせる）", setup.physicsDrive);
-            float tons = setup.massTons;
-            using (new EditorGUI.DisabledScope(!phys))
-                tons = EditorGUILayout.Slider("車重（トン）", setup.massTons, 1f, 120f);
-            if (EditorGUI.EndChangeCheck())
-            {
-                Undo.RecordObject(setup, "物理演算の設定");
-                setup.physicsDrive = phys;
-                setup.massTons = tons;
-            }
-            EditorGUILayout.HelpBox(setup.physicsDrive
-                ? "転輪ごとのトーションバーが車体を支え、左右の履帯の駆動力で走ります。坂・段差・障害物・反動が車体の動きに出ます。"
-                : "物理演算なし：地面に沿って滑らかに動きます（軽い。AI の大量配置向け）。", MessageType.None);
-            if (setup.physicsDrive && (!setup.trackLeft || !setup.suspension))
-                EditorGUILayout.HelpBox("物理演算の走行は転輪のサスペンションで車体を押すので、履帯がない・サスペンションを使わないときは自動で「物理演算なし」になります。", MessageType.Warning);
         }
+
+        // ------------------------------------------------------------------ finish (always at the bottom)
 
         void DrawFinish()
         {
-            Section("⑤ 仕上げ");
-            createGround = EditorGUILayout.ToggleLeft("テスト用の地面を作る（坂・丘・的・壁・石・丸太・段差つき）", createGround);
-            setupCamera = EditorGUILayout.ToggleLeft("メインカメラを戦車の三人称カメラにする", setupCamera);
-            if (!setup.trackLeft) EditorGUILayout.HelpBox("履帯がまだありません（履帯なしでも完成させられます）。", MessageType.Warning);
-            if (!setup.gun) EditorGUILayout.HelpBox("砲座が指定されていないので完成させられません。", MessageType.Error);
-            using (new EditorGUI.DisabledScope(!setup.gun))
-            if (GUILayout.Button("戦車を完成させる（リギング）", bigButton, GUILayout.Height(36f)))
+            Line();
+            EditorGUILayout.Space(2f);
+            if (!setup.gun) EditorGUILayout.HelpBox("砲座が指定されていないので完成させられません（① 部位）。", MessageType.Error);
+            else if (!setup.trackLeft) EditorGUILayout.LabelField("履帯がまだありません（履帯なしでも完成させられます）。", EditorStyles.miniLabel);
+            using (new EditorGUILayout.HorizontalScope())
             {
-                suspensionPreview = 0f;
-                var c = TankRigBuilder.Complete(setup, createGround, setupCamera);
-                Selection.activeGameObject = c.gameObject;
-                status = "完成しました。▶ で再生すると、WASD で走行、マウスで照準、左クリックで主砲、Space で機銃、右クリックでズーム、L でライトです。設定を変えたら、もう一度このボタンを押してください。";
+                using (new EditorGUI.DisabledScope(!setup.gun))
+                    if (GUILayout.Button(new GUIContent("戦車を完成させる", "操縦・照準・武装・エフェクト・ライト・カメラ・物理を組み込みます。設定を変えたら押し直してください"), bigButton, GUILayout.Height(32f)))
+                    {
+                        suspensionPreview = 0f;
+                        var c = TankRigBuilder.Complete(setup, createGround, setupCamera);
+                        Selection.activeGameObject = c.gameObject;
+                        status = "完成しました。▶ で再生すると、WASD で走行、マウスで照準、左クリックで主砲、Space で機銃、中クリックか F で副武装、右クリックでズーム、L でライトです。設定を変えたら、もう一度「戦車を完成させる」を押してください。";
+                    }
+                using (new EditorGUI.DisabledScope(!setup.GetComponent<TankController>() || EditorApplication.isPlayingOrWillChangePlaymode))
+                    if (GUILayout.Button(new GUIContent("▶ 試す", "プレイして走らせてみます"), GUILayout.Height(32f), GUILayout.Width(80f)))
+                    {
+                        ResetPreview();
+                        EditorApplication.isPlaying = true;
+                    }
             }
-            using (new EditorGUI.DisabledScope(!setup.GetComponent<TankController>() || EditorApplication.isPlayingOrWillChangePlaymode))
-            {
-                if (GUILayout.Button("▶ プレイして試す", GUILayout.Height(28f)))
+            string opts = (createGround ? "テスト用の地面あり" : "地面なし") + "・" + (setupCamera ? "カメラを設定" : "カメラはそのまま");
+            finishOptions = EditorGUILayout.Foldout(finishOptions, "完成時のオプション（" + opts + "）", true);
+            if (finishOptions)
+                using (new EditorGUI.IndentLevelScope())
                 {
-                    ResetPreview();
-                    EditorApplication.isPlaying = true;
+                    createGround = EditorGUILayout.ToggleLeft("テスト用の地面を作る（坂・丘・的・壁・石・丸太・段差つき）", createGround);
+                    setupCamera = EditorGUILayout.ToggleLeft("メインカメラを戦車の三人称カメラにする", setupCamera);
                 }
-            }
+            EditorGUILayout.Space(2f);
         }
 
         // ------------------------------------------------------------------ scene view
@@ -532,17 +746,20 @@ namespace TankRig.Editor
         static Color PointColor(TankRigBuilder.PointKind k) => k switch
         {
             TankRigBuilder.PointKind.Muzzle => new Color(1f, 0.45f, 0.2f),
-            TankRigBuilder.PointKind.MachineGun => new Color(1f, 0.85f, 0.2f),
             TankRigBuilder.PointKind.Exhaust => new Color(0.75f, 0.75f, 0.75f),
             TankRigBuilder.PointKind.Headlight => new Color(0.5f, 0.85f, 1f),
             _ => new Color(1f, 0.25f, 0.3f),
         };
+
+        static readonly Color MachineGunColor = new Color(1f, 0.85f, 0.2f);
+        static readonly Color SecondaryColor = new Color(1f, 0.4f, 0.85f);
 
         void OnSceneGUI(SceneView sv)
         {
             if (!setup || EditorApplication.isPlaying) return;
             var root = setup.transform;
             float size = HandleUtility.GetHandleSize(root.position);
+            if (view != ViewMode.Free) DrawGrid(sv);
 
             // front arrow
             Handles.color = new Color(0.2f, 0.8f, 1f, 0.9f);
@@ -552,20 +769,14 @@ namespace TankRig.Editor
             // tracks: move the left one, the right one follows mirrored
             if (setup.trackLeft)
             {
-                Handles.Label(setup.trackLeft.position + root.up * size * 0.6f, "履帯（左）\n右は左右対称");
+                string blocks = view != ViewMode.Free || SnapStep > 0f ? "\n" + BlockText(TankRigBuilder.TrackOffsetBlocks(setup)) : "";
+                Handles.Label(setup.trackLeft.position + root.up * size * 0.6f, "履帯（左）\n右は左右対称" + blocks);
                 if (setup.trackRight) Handles.Label(setup.trackRight.position + root.up * size * 0.6f, "履帯（右）");
-                if (focus == FocusMode.Track)
+                if (focus.kind == TargetKind.Track)
                 {
-                    EditorGUI.BeginChangeCheck();
-                    Vector3 p = Handles.PositionHandle(setup.trackLeft.position, root.rotation);
-                    if (EditorGUI.EndChangeCheck())
+                    if (Drag(setup.trackLeft.position, root.rotation, new Color(0.3f, 1f, 0.6f), out var p))
                     {
-                        Undo.RecordObject(setup, "履帯の移動");
-                        Undo.RecordObject(setup.trackLeft, "履帯の移動");
-                        if (setup.trackRight) Undo.RecordObject(setup.trackRight, "履帯の移動");
-                        var l = root.InverseTransformPoint(p);
-                        setup.trackOffset = new Vector3(Mathf.Max(0.02f, -l.x), l.y, l.z);
-                        setup.ApplyTrackPose();
+                        TankRigBuilder.SetTrackPosition(setup, p);
                         Repaint();
                     }
                 }
@@ -573,7 +784,7 @@ namespace TankRig.Editor
                 {
                     Handles.color = new Color(0.3f, 1f, 0.6f);
                     float hs = HandleUtility.GetHandleSize(setup.trackLeft.position) * 0.15f;
-                    if (Handles.Button(setup.trackLeft.position, root.rotation, hs, hs, Handles.CubeHandleCap)) { focus = FocusMode.Track; Repaint(); }
+                    if (Handles.Button(setup.trackLeft.position, root.rotation, hs, hs, Handles.CubeHandleCap)) Select(Target.Track);
                 }
             }
 
@@ -598,58 +809,113 @@ namespace TankRig.Editor
                 }
             }
 
-            // points
+            // effect points
             foreach (var k in TankRigBuilder.AllPoints)
             {
                 var t = TankRigBuilder.GetPoint(setup, k);
                 if (!t) continue;
-                float hs = HandleUtility.GetHandleSize(t.position);
-                Handles.color = PointColor(k);
-                Handles.DrawLine(t.position, t.position + t.forward * hs * 0.9f, 2f);
-                Handles.Label(t.position + root.up * hs * 0.25f, TankRigBuilder.Label(k));
                 var mirror = TankRigBuilder.GetMirror(setup, k);
                 if (mirror && TankRigBuilder.IsMirrored(setup, k))
                 {
+                    float hs = HandleUtility.GetHandleSize(mirror.position);
+                    Handles.color = PointColor(k);
                     Handles.SphereHandleCap(0, mirror.position, Quaternion.identity, hs * 0.1f, EventType.Repaint);
                     Handles.DrawLine(mirror.position, mirror.position + mirror.forward * hs * 0.9f, 2f);
                 }
+                PointHandle(Target.Point(k), t, TankRigBuilder.Label(k), PointColor(k), mirror, () => setup.SyncMirrors());
+            }
 
-                if (focus == FocusMode.Point && focusPoint == k)
+            // machine guns
+            for (int i = 0; setup.machineGuns != null && i < setup.machineGuns.Count; i++)
+            {
+                var mg = setup.machineGuns[i];
+                if (mg == null || !mg.point) continue;
+                PointHandle(Target.MachineGun(i), mg.point, mg.name, MachineGunColor, null, null);
+                if (mg.aimCone > 0f)
                 {
-                    if (Tools.current == Tool.Rotate)
-                    {
-                        EditorGUI.BeginChangeCheck();
-                        var r = Handles.RotationHandle(t.rotation, t.position);
-                        if (EditorGUI.EndChangeCheck())
-                        {
-                            Undo.RecordObject(t, "ポイントの回転");
-                            if (TankRigBuilder.GetMirror(setup, k)) Undo.RecordObject(TankRigBuilder.GetMirror(setup, k), "ポイントの回転");
-                            t.rotation = r;
-                            setup.SyncMirrors();
-                        }
-                    }
-                    else
-                    {
-                        EditorGUI.BeginChangeCheck();
-                        var p = Handles.PositionHandle(t.position, Tools.pivotRotation == PivotRotation.Local ? t.rotation : root.rotation);
-                        if (EditorGUI.EndChangeCheck())
-                        {
-                            Undo.RecordObject(t, "ポイントの移動");
-                            if (TankRigBuilder.GetMirror(setup, k)) Undo.RecordObject(TankRigBuilder.GetMirror(setup, k), "ポイントの移動");
-                            t.position = p;
-                            setup.SyncMirrors();
-                        }
-                    }
-                }
-                else if (Handles.Button(t.position, Quaternion.identity, hs * 0.12f, hs * 0.14f, Handles.SphereHandleCap))
-                {
-                    focus = FocusMode.Point;
-                    focusPoint = k;
-                    Repaint();
+                    // the cone it can turn in
+                    float hs = HandleUtility.GetHandleSize(mg.point.position) * 0.8f;
+                    float r = Mathf.Tan(Mathf.Min(mg.aimCone, 80f) * Mathf.Deg2Rad) * hs;
+                    Handles.color = new Color(1f, 0.85f, 0.2f, 0.5f);
+                    Handles.DrawWireDisc(mg.point.position + mg.point.forward * hs, mg.point.forward, r);
                 }
             }
 
+            // secondary turrets: traverse range and muzzle
+            for (int i = 0; setup.secondaryTurrets != null && i < setup.secondaryTurrets.Count; i++)
+            {
+                var st = setup.secondaryTurrets[i];
+                if (st == null) continue;
+                if (st.turret && st.muzzle)
+                {
+                    Vector3 axisW = st.turret.TransformDirection(st.turretAxisLocal).normalized;
+                    Vector3 fwd = Vector3.ProjectOnPlane(st.muzzle.forward, axisW);
+                    if (fwd.sqrMagnitude > 1e-4f)
+                    {
+                        fwd.Normalize();
+                        float r = HandleUtility.GetHandleSize(st.turret.position) * 0.7f;
+                        float min = st.FullCircle ? -180f : st.minTraverse, max = st.FullCircle ? 180f : st.maxTraverse;
+                        Handles.color = new Color(1f, 0.4f, 0.85f, 0.55f);
+                        Handles.DrawWireArc(st.turret.position, axisW, Quaternion.AngleAxis(min, axisW) * fwd, max - min, r, 2f);
+                        if (!st.FullCircle)
+                        {
+                            Handles.DrawLine(st.turret.position, st.turret.position + Quaternion.AngleAxis(min, axisW) * fwd * r);
+                            Handles.DrawLine(st.turret.position, st.turret.position + Quaternion.AngleAxis(max, axisW) * fwd * r);
+                        }
+                    }
+                }
+                if (st.muzzle) PointHandle(Target.Secondary(i), st.muzzle, st.name + "の砲口", SecondaryColor, null, null);
+            }
+
             if (placing.HasValue) HandlePlacing(sv);
+        }
+
+        /// <summary>Line + label for a point; a button to pick it, or move / rotate handles when it is the one being edited.</summary>
+        void PointHandle(Target target, Transform t, string label, Color color, Transform mirror, System.Action afterChange)
+        {
+            var root = setup.transform;
+            float hs = HandleUtility.GetHandleSize(t.position);
+            Handles.color = color;
+            Handles.DrawLine(t.position, t.position + t.forward * hs * 0.9f, 2f);
+            Handles.Label(t.position + root.up * hs * 0.25f, label);
+            if (!focus.Is(target))
+            {
+                Handles.color = color;
+                if (Handles.Button(t.position, Quaternion.identity, hs * 0.12f, hs * 0.14f, Handles.SphereHandleCap))
+                    Select(target);
+                return;
+            }
+            if (Tools.current == Tool.Rotate)
+            {
+                EditorGUI.BeginChangeCheck();
+                Quaternion r;
+                if (view != ViewMode.Free)
+                {
+                    // three-view: turn in the drawing plane only
+                    Handles.color = color;
+                    r = Handles.Disc(t.rotation, t.position, SceneView.currentDrawingSceneView.camera.transform.forward, hs * 0.8f, false, 0f);
+                }
+                else r = Handles.RotationHandle(t.rotation, t.position);
+                if (EditorGUI.EndChangeCheck())
+                {
+                    Undo.RecordObject(t, "ポイントの回転");
+                    if (mirror) Undo.RecordObject(mirror, "ポイントの回転");
+                    t.rotation = r;
+                    afterChange?.Invoke();
+                }
+            }
+            else if (Drag(t.position, Tools.pivotRotation == PivotRotation.Local ? t.rotation : root.rotation, color, out var p))
+            {
+                Undo.RecordObject(t, "ポイントの移動");
+                if (mirror) Undo.RecordObject(mirror, "ポイントの移動");
+                t.position = p;
+                afterChange?.Invoke();
+            }
+            if (view != ViewMode.Free || SnapStep > 0f)
+            {
+                Vector3 local = root.InverseTransformPoint(t.position) / TankRigBuilder.BlockSize(setup);
+                Handles.Label(t.position - root.up * hs * 0.25f, $"左右 {local.x:+0.##;-0.##;0} / 高さ {local.y:0.##} / 前後 {local.z:+0.##;-0.##;0} ブロック");
+            }
         }
 
         void HandlePlacing(SceneView sv)
@@ -658,8 +924,8 @@ namespace TankRig.Editor
             int id = GUIUtility.GetControlID(FocusType.Passive);
             HandleUtility.AddDefaultControl(id);
             Handles.BeginGUI();
-            var r = new Rect(e.mousePosition.x + 14f, e.mousePosition.y + 4f, 260f, 22f);
-            GUI.Box(r, "クリックして配置: " + TankRigBuilder.Label(placing.Value) + "（Esc で中止）");
+            var r = new Rect(e.mousePosition.x + 14f, e.mousePosition.y + 4f, 300f, 22f);
+            GUI.Box(r, "クリックして配置: " + TargetLabel(placing.Value) + "（Esc で中止）");
             Handles.EndGUI();
             if (e.type == EventType.MouseMove) sv.Repaint();
             if (e.type == EventType.KeyDown && e.keyCode == KeyCode.Escape)
@@ -675,15 +941,34 @@ namespace TankRig.Editor
                 var filters = setup.model ? setup.model.GetComponentsInChildren<MeshFilter>() : setup.GetComponentsInChildren<MeshFilter>();
                 if (MeshRaycast.Raycast(ray, filters, out var hit))
                 {
-                    var k = placing.Value;
-                    TankRigBuilder.PlacePoint(setup, k, hit.point + hit.normal * 0.03f);
-                    focus = FocusMode.Point;
-                    focusPoint = k;
+                    var target = placing.Value;
+                    Vector3 p = hit.point + hit.normal * 0.03f;
+                    if (SnapStep > 0f) p = TankRigBuilder.Snap(setup, p, SnapStep);
+                    switch (target.kind)
+                    {
+                        case TargetKind.Point: TankRigBuilder.PlacePoint(setup, target.point, p); break;
+                        case TargetKind.MachineGun: TankRigBuilder.PlaceMachineGun(setup, target.index, p, false); break;
+                        case TargetKind.SecondaryMuzzle: TankRigBuilder.PlaceSecondaryMuzzle(setup, setup.secondaryTurrets[target.index], p, null); break;
+                    }
+                    Select(target);
                     placing = null;
-                    status = TankRigBuilder.Label(k) + "を置きました。";
+                    status = TargetLabel(target) + "を置きました。";
                     Repaint();
                 }
                 e.Use();
+            }
+        }
+
+        string TargetLabel(Target t)
+        {
+            switch (t.kind)
+            {
+                case TargetKind.Point: return TankRigBuilder.Label(t.point);
+                case TargetKind.MachineGun:
+                    return setup.machineGuns != null && t.index < setup.machineGuns.Count ? setup.machineGuns[t.index].name : "機銃";
+                case TargetKind.SecondaryMuzzle:
+                    return (setup.secondaryTurrets != null && t.index < setup.secondaryTurrets.Count ? setup.secondaryTurrets[t.index].name : "副砲塔") + "の砲口";
+                default: return "履帯";
             }
         }
     }

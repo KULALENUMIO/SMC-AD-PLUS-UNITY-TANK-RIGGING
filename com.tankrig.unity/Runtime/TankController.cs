@@ -13,7 +13,7 @@ namespace TankRig
     [AddComponentMenu("Tank Rig/Tank Controller")]
     [DisallowMultipleComponent]
     [DefaultExecutionOrder(-50)] // move the hull before the tracks let their wheels find the ground
-    public class TankController : MonoBehaviour
+    public partial class TankController : MonoBehaviour
     {
         [Header("部位")]
         public Transform hull;
@@ -30,7 +30,7 @@ namespace TankRig
 
         [Header("ポイント")]
         public Transform muzzle;
-        public Transform machineGun;
+        [Tooltip("旧形式（v0.6 まで）の機銃。machineGuns が空のときだけ使う")] [HideInInspector] public Transform machineGun;
         public Transform[] exhausts = new Transform[0];
         public Transform[] headlights = new Transform[0];
         public Transform[] rearLights = new Transform[0];
@@ -70,10 +70,11 @@ namespace TankRig
         [Tooltip("発砲の反動（N·s）")] public float recoilImpulse = 35000f;
         [Tooltip("段差・丸太に当たった履帯がベルトで車体を引き上げる力（当たる力に対する比率）")] public float climbGrip = 0.9f;
 
-        [Header("サスペンション（Kinematic モードの車体の揺れ）")]
-        [Tooltip("車体の揺れの強さ（0 で揺れない）")] [Range(0f, 3f)] public float bodySway = 1f;
-        [Tooltip("加速・減速 1 m/s² あたりの前後の傾き（度）")] public float pitchPerAccel = 0.5f;
-        [Tooltip("横方向の加速度 1 m/s² あたりの横の傾き（度）")] public float rollPerLateral = 0.5f;
+        [Header("サスペンション（車体の揺れ）")]
+        [Tooltip("車体の揺れの強さ（0 で揺れない）。旋回時の傾きは Physics モードでも使う")] [Range(0f, 3f)] public float bodySway = 1f;
+        [Tooltip("加速・減速 1 m/s² あたりの前後の傾き（度。Kinematic モード）")] public float pitchPerAccel = 0.5f;
+        [Tooltip("旋回時、横方向の加速度 1 m/s² あたりに外側へ傾く角度（度）。Physics / Kinematic 両方")] public float rollPerLateral = 0.5f;
+        [Tooltip("旋回時の傾きの上限（度）")] public float maxTurnLean = 6f;
         public float swayStiffness = 55f;
         public float swayDamping = 9f;
         [Tooltip("着地したときの沈み込みの強さ")] public float landingBounce = 0.5f;
@@ -94,16 +95,24 @@ namespace TankRig
         [Tooltip("火力 1 のときの砲身の後退量（m）")] public float recoilDistance = 0.35f;
         [Tooltip("砲身の後退量の上限（m）")] public float maxRecoilDistance = 0.8f;
         [Tooltip("砲身が元の位置に戻る速さ")] public float recoilReturn = 3.5f;
-        public float machineGunInterval = 0.08f;
-        public float range = 1500f;
+        [HideInInspector] public float machineGunInterval = 0.08f;
+        [Tooltip("主砲の射程（m）")] public float range = 1500f;
         public float muzzleLightIntensity = 12f;
 
+        [Header("機銃（いくつでも）")]
+        public TankMachineGun[] machineGuns = new TankMachineGun[0];
+
+        [Header("副砲塔（いくつでも。砲塔・砲架・砲身はどれもなくて可）")]
+        public TankSecondaryTurret[] secondaryTurrets = new TankSecondaryTurret[0];
+
         [Header("エフェクト")]
+        [Tooltip("組み込みのエフェクト（発砲炎・煙・光・曳光弾・着弾・排気煙）を使う。別のエフェクト（GunFired / RoundFired を使うもの）に任せるときはオフ")]
+        public bool builtInEffects = true;
         public ParticleSystem[] exhaustSmoke = new ParticleSystem[0];
         public ParticleSystem muzzleFlash;
         public ParticleSystem muzzleSmoke;
-        public ParticleSystem machineGunTracer;
-        public ParticleSystem machineGunFlash;
+        [HideInInspector] public ParticleSystem machineGunTracer;
+        [HideInInspector] public ParticleSystem machineGunFlash;
         public ParticleSystem impactDust;
         public ParticleSystem impactSparks;
         public Light muzzleLight;
@@ -122,6 +131,8 @@ namespace TankRig
         [Tooltip("外部入力のときの照準点（ワールド）。カメラがない場合や外部入力時に使う")] public Vector3 externalAimPoint;
 
         public float Speed { get; private set; }
+        /// <summary>This frame's input (keyboard / mouse or externalInput). For effects that follow the driver (engine load...).</summary>
+        public TankInputState CurrentInput => lastInput;
         public Vector3 AimPoint { get; private set; }
         public float Reload01 => reloadTime <= 0f ? 1f : 1f - Mathf.Clamp01(reloadTimer / reloadTime);
 
@@ -130,7 +141,7 @@ namespace TankRig
         bool barrelFollows;             // not a child of the mount: carried along with it from here
         Vector3 barrelRelPos;
         Quaternion barrelRelRot = Quaternion.identity;
-        float yaw, turretAngle, gunAngle, elevSign = 1f, vy, reloadTimer, mgTimer, recoil, flash;
+        float yaw, turretAngle, gunAngle, elevSign = 1f, vy, reloadTimer, recoil, flash;
         Vector3 surfaceUp = Vector3.up;
         Vector3 basePos;
         float lastSpeed, swayPitch, swayPitchVel, swayRoll, swayRollVel, bounce, bounceVel;
@@ -197,6 +208,7 @@ namespace TankRig
                 for (int i = 0; i < rearLightLights.Length; i++) rearBase[i] = rearLightLights[i] ? rearLightLights[i].intensity : 0f;
             }
             SetLights(lightsOn);
+            InitWeapons();
         }
 
         // after every track's OnEnable has built its suspension arms
@@ -281,7 +293,9 @@ namespace TankRig
                 if (aimCamera && Cursor.lockState != CursorLockMode.Locked)
                 {
                     input.fireMain = false;
+                    input.holdMain = false;
                     input.fireMachineGun = false;
+                    input.fireSecondary = false;
                 }
             }
             lastInput = input;
@@ -359,6 +373,8 @@ namespace TankRig
             for (int s = 0; s < 2; s++) { sidePoint[s] = Vector3.zero; sideLoad[s] = 0f; sideCount[s] = 0; }
             contactN = 0;
             float perWheelMass = mass / Mathf.Max(1, suspendedWheels);
+            float rollStiffness = 0f; // N·m/rad of the loaded torsion bars, for the turn lean
+            Vector3 hullRight = rot * Vector3.right, com = rb.worldCenterOfMass;
             for (int s = 0; s < 2; s++)
             {
                 var t = sides[s];
@@ -380,6 +396,8 @@ namespace TankRig
                     }
                     float k = perWheelMass * g / Mathf.Max(0.01f, c.restTravel);
                     float damper = 2f * suspensionDamping * Mathf.Sqrt(k * perWheelMass);
+                    float side = Vector3.Dot(c.point - com, hullRight);
+                    rollStiffness += k * side * side;
                     // a wheel has mass: when its ray suddenly lands on top of an obstacle it is pushed up over a few steps,
                     // not teleported (a jump of the travel would make the damper kick the hull into the air)
                     float travel = Mathf.Min(c.travel, prevTravel[s][i] + wheelRiseSpeed * dt);
@@ -522,6 +540,17 @@ namespace TankRig
             // plus the side slope's pull, so a tank on a side slope does not slide down it slowly
             float latForce = -vLat * mass * lateralResponse - mass * Vector3.Dot(Physics.gravity, right);
             rb.AddForceAtPosition(right * Mathf.Clamp(latForce, -latLimit, latLimit), centre);
+
+            // turn lean: the hull rolls out of the turn on its torsion bars. The grip force above already does a little
+            // (it acts below the centre of mass), but a real hull sits high on soft bars and leans far more. Add the roll
+            // moment that the bars turn into rollPerLateral degrees per m/s² of sideways acceleration.
+            if (bodySway > 0f && rollPerLateral > 0f && rollStiffness > 0f)
+            {
+                float yawMeasured = Vector3.Dot(rb.angularVelocity, n);
+                float aLat = Mathf.Clamp(measured * yawMeasured, -lateralGrip * g, lateralGrip * g);
+                float lean = Mathf.Clamp(aLat * rollPerLateral * bodySway, -maxTurnLean, maxTurnLean) * Mathf.Deg2Rad;
+                rb.AddTorque(hullFwd * (rollStiffness * lean));
+            }
         }
 
         /// <summary>
@@ -668,7 +697,7 @@ namespace TankRig
             float accel = (Speed - lastSpeed) / dt;
             lastSpeed = Speed;
             float targetPitch = Mathf.Clamp(-accel * pitchPerAccel * bodySway, -4f, 4f);
-            float targetRoll = Mathf.Clamp(Speed * w * rollPerLateral * bodySway, -6f, 6f);
+            float targetRoll = Mathf.Clamp(Speed * w * rollPerLateral * bodySway, -maxTurnLean, maxTurnLean);
             Spring(ref swayPitch, ref swayPitchVel, targetPitch, swayStiffness, swayDamping, dt);
             Spring(ref swayRoll, ref swayRollVel, targetRoll, swayStiffness, swayDamping, dt);
             Spring(ref bounce, ref bounceVel, 0f, bounceStiffness, bounceDamping, dt);
@@ -754,6 +783,8 @@ namespace TankRig
                     barrel.localPosition = barrelRestPos + barrel.parent.InverseTransformVector(backW);
             }
             else recoil = 0f;
+
+            AimSecondaryWeapons(dt);
         }
 
         // ------------------------------------------------------------------ weapons
@@ -761,13 +792,8 @@ namespace TankRig
         void Weapons(TankInputState input, float dt)
         {
             reloadTimer = Mathf.Max(0f, reloadTimer - dt);
-            mgTimer -= dt;
             if (input.fireMain && reloadTimer <= 0f) FireMain();
-            if (input.fireMachineGun && mgTimer <= 0f)
-            {
-                mgTimer = machineGunInterval;
-                FireMachineGun();
-            }
+            TickSecondaryWeapons(input, dt);
         }
 
         public void FireMain()
@@ -776,10 +802,23 @@ namespace TankRig
             float p = Mathf.Max(0f, gunPower);
             if (barrel) recoil = Mathf.Min(recoilDistance * p, maxRecoilDistance);
             flash = Mathf.Min(1f + 0.3f * (p - 1f), 2f);
-            if (muzzleFlash) muzzleFlash.Play(true);
-            if (muzzleSmoke) muzzleSmoke.Play(true);
+            if (builtInEffects && muzzleFlash) muzzleFlash.Play(true);
+            if (builtInEffects && muzzleSmoke) muzzleSmoke.Play(true);
             if (aimCamera) aimCamera.Shake(0.4f * p);
             Transform m = muzzle ? muzzle : gun ? gun : transform;
+            Kick(m, p);
+            bool didHit = TankPhysics.Raycast(m.position, m.forward, range, groundMask, transform, out RaycastHit hit);
+            if (didHit && builtInEffects)
+            {
+                Emit(impactDust, hit.point, 30);
+                Emit(impactSparks, hit.point, 20);
+            }
+            GunFired?.Invoke(this, new GunShot { muzzle = m, power = p, hit = didHit, hitInfo = hit });
+        }
+
+        /// <summary>Recoil of a gun of power <paramref name="p"/> fired from <paramref name="m"/> (hull impulse, or the sway springs).</summary>
+        void Kick(Transform m, float p)
+        {
             if (physics) rb.AddForceAtPosition(-m.forward * (recoilImpulse * p), m.position, ForceMode.Impulse);
             else
             {
@@ -788,24 +827,14 @@ namespace TankRig
                 swayPitchVel -= 40f * p * Mathf.Max(0.2f, -back.z);
                 swayRollVel -= 40f * p * back.x; // gun to the right: the top of the hull leans left
             }
-            if (TankPhysics.Raycast(m.position, m.forward, range, groundMask, transform, out RaycastHit hit))
-            {
-                Emit(impactDust, hit.point, 30);
-                Emit(impactSparks, hit.point, 20);
-            }
         }
 
+        /// <summary>One round from every machine gun on the Space trigger (ignores the rate of fire; for scripts).</summary>
         public void FireMachineGun()
         {
-            Transform m = machineGun ? machineGun : muzzle;
-            if (!m) return;
-            if (machineGunTracer) machineGunTracer.Emit(1);
-            if (machineGunFlash) machineGunFlash.Emit(1);
-            if (TankPhysics.Raycast(m.position, m.forward, range, groundMask, transform, out RaycastHit hit))
-            {
-                Emit(impactDust, hit.point, 2);
-                Emit(impactSparks, hit.point, 3);
-            }
+            foreach (var mg in machineGuns)
+                if (mg != null && mg.point && mg.trigger == WeaponTrigger.MachineGun)
+                    FireRound(mg.point, mg.spec, mg.tracer, mg.flash, mg.Feed);
         }
 
         static void Emit(ParticleSystem ps, Vector3 worldPos, int count)
@@ -820,7 +849,13 @@ namespace TankRig
         void UpdateEffects(TankInputState input, float dt)
         {
             flash = Mathf.MoveTowards(flash, 0f, dt * 10f);
-            if (muzzleLight) muzzleLight.intensity = flash * muzzleLightIntensity;
+            if (muzzleLight) muzzleLight.intensity = builtInEffects ? flash * muzzleLightIntensity : 0f;
+            foreach (var st in secondaryTurrets)
+            {
+                if (st == null) continue;
+                st.flash = Mathf.MoveTowards(st.flash, 0f, dt * 10f);
+                if (st.muzzleLight) st.muzzleLight.intensity = st.flash * muzzleLightIntensity * 0.6f;
+            }
 
             float load = Mathf.Clamp01(Mathf.Abs(input.throttle) * 0.6f + Mathf.Abs(Speed) / Mathf.Max(0.1f, maxForwardSpeed) * 0.4f);
             if (exhaustSmoke != null)
@@ -828,7 +863,7 @@ namespace TankRig
                 {
                     if (!ps) continue;
                     var em = ps.emission;
-                    em.rateOverTime = Mathf.Lerp(exhaustIdleRate, exhaustMaxRate, load);
+                    em.rateOverTime = builtInEffects ? Mathf.Lerp(exhaustIdleRate, exhaustMaxRate, load) : 0f;
                 }
 
             if (input.toggleLights) SetLights(!lightsOn);

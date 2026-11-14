@@ -14,7 +14,9 @@ namespace TankRig
         public Vector2 look;        // mouse delta (pixels)
         public float scroll;        // mouse wheel (notches)
         public bool fireMain;       // left click (this frame)
+        public bool holdMain;       // left button (held): machine guns on the main gun's button
         public bool fireMachineGun; // Space (held)
+        public bool fireSecondary;  // middle button or F (held): secondary weapons
         public bool aim;            // right mouse (held): zoom
         public bool toggleLights;   // L (this frame)
         public bool unlockCursor;   // Esc (this frame)
@@ -34,6 +36,7 @@ namespace TankRig
                 s.throttle = (k.wKey.isPressed ? 1f : 0f) - (k.sKey.isPressed ? 1f : 0f);
                 s.steer = (k.dKey.isPressed ? 1f : 0f) - (k.aKey.isPressed ? 1f : 0f);
                 s.fireMachineGun = k.spaceKey.isPressed;
+                s.fireSecondary = k.fKey.isPressed;
                 s.toggleLights = k.lKey.wasPressedThisFrame;
                 s.unlockCursor = k.escapeKey.wasPressedThisFrame;
             }
@@ -44,6 +47,8 @@ namespace TankRig
                 float sy = m.scroll.ReadValue().y;
                 s.scroll = Mathf.Abs(sy) >= 10f ? sy / 120f : sy;
                 s.fireMain = m.leftButton.wasPressedThisFrame;
+                s.holdMain = m.leftButton.isPressed;
+                s.fireSecondary |= m.middleButton.isPressed;
                 s.click = s.fireMain;
                 s.aim = m.rightButton.isPressed;
             }
@@ -51,6 +56,8 @@ namespace TankRig
             s.throttle = (Input.GetKey(KeyCode.W) ? 1f : 0f) - (Input.GetKey(KeyCode.S) ? 1f : 0f);
             s.steer = (Input.GetKey(KeyCode.D) ? 1f : 0f) - (Input.GetKey(KeyCode.A) ? 1f : 0f);
             s.fireMachineGun = Input.GetKey(KeyCode.Space);
+            s.fireSecondary = Input.GetKey(KeyCode.F) || Input.GetMouseButton(2);
+            s.holdMain = Input.GetMouseButton(0);
             s.toggleLights = Input.GetKeyDown(KeyCode.L);
             s.unlockCursor = Input.GetKeyDown(KeyCode.Escape);
             s.look = new Vector2(Input.GetAxisRaw("Mouse X"), Input.GetAxisRaw("Mouse Y")) * 10f;
