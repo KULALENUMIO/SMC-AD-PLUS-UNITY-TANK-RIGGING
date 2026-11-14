@@ -1,0 +1,6 @@
+{
+    "name": "TankRig.Runtime",
+    "rootNamespace": "TankRig",
+    "references": [ "Unity.InputSystem" ],
+    "autoReferenced": true
+}

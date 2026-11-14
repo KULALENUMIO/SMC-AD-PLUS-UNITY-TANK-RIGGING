@@ -1,0 +1,7 @@
+{
+    "name": "TankRig.Editor",
+    "rootNamespace": "TankRig.Editor",
+    "references": [ "TankRig.Runtime" ],
+    "includePlatforms": [ "Editor" ],
+    "autoReferenced": true
+}
